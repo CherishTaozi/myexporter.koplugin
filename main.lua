@@ -1,0 +1,476 @@
+--[[--
+Export highlights to My Clippings and XMNote (纸间书摘).
+
+Fork of the built-in exporter plugin, kept update-proof in a single plugin:
+- only two targets: my_clippings and xmnote
+- my_clippings gets Kindle-like stable in-book locations (#N), see clip.lua
+
+Conventions:
+
+- Target: each local format or remote service this plugin can translate to.
+Each target inherits from "myexporter/base" and implements *at least* an export function.
+
+- Highlight: Text or image in document. Stored in "annotations" table of documents sidecar file.
+
+- Clippings: Parsed form of highlights. Single table for all documents.
+
+- Booknotes: Every table in clippings table. clippings = {"title" = booknotes}
+
+@module koplugin.myexporter
+--]]--
+
+local ButtonSelector = require("ui/widget/buttonselector")
+local DataStorage = require("datastorage")
+local Device = require("device")
+local Dispatcher = require("dispatcher")
+local InfoMessage = require("ui/widget/infomessage")
+local MyClipping = require("myexporter/clip")
+local NetworkMgr = require("ui/network/manager")
+local ReaderHighlight = require("apps/reader/modules/readerhighlight")
+local UIManager = require("ui/uimanager")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local filemanagerutil = require("apps/filemanager/filemanagerutil")
+local ffiUtil = require("ffi/util")
+local logger = require("logger")
+local util = require("util")
+local T = ffiUtil.template
+local _ = require("gettext")
+
+-- update clippings from history clippings
+local function updateHistoryClippings(clippings, new_clippings)
+    for title, booknotes in pairs(new_clippings) do
+        for chapter_index, chapternotes in ipairs(booknotes) do
+            for note_index, note in ipairs(chapternotes) do
+                if clippings[title] == nil or clippings[title][chapter_index] == nil
+                    or clippings[title][chapter_index][note_index] == nil
+                    or clippings[title][chapter_index][note_index].page ~= note.page
+                    or clippings[title][chapter_index][note_index].time ~= note.time
+                    or clippings[title][chapter_index][note_index].text ~= note.text
+                    or clippings[title][chapter_index][note_index].note ~= note.note then
+                    logger.dbg("found new notes in history", booknotes.title)
+                    clippings[title] = booknotes
+                end
+            end
+        end
+    end
+    return clippings
+end
+
+local targets = {
+    my_clippings = require("myexporter/target/my_clippings"),
+    xmnote = require("myexporter/target/xmnote"),
+}
+
+local function genExportersTable(path)
+    local t = {}
+    for k, v in pairs(targets) do
+        t[k] = v
+    end
+    for _, v in pairs(t) do
+        v.path = path
+    end
+    return t
+end
+
+local MyExporter = WidgetContainer:extend{
+    name = "myexporter",
+    default_clipping_dir = DataStorage:getFullDataDir() .. "/clipboard",
+    default_clipping_filename_single   = "%D-%M %A - %T",   -- "yyyy-mm-dd-hh-mm-ss author - title"
+    default_clipping_filename_multiple = "%D-%M all-books", -- see patterns in FileManagerBookInfo:expandString()
+}
+
+function MyExporter:init()
+    self.settings = G_reader_settings:readSetting("myexporter", {})
+    self.parser = MyClipping:new{
+        ui = self.ui,
+        settings = self.settings,
+    }
+    self.targets = genExportersTable(self.path)
+    self.ui.menu:registerToMainMenu(self)
+    self:onDispatcherRegisterActions()
+    self.ui.folder_shortcuts.registerShortcut({
+        provider = MyExporter.name,
+        name = _("Export highlights folder"),
+        get = function()
+            return self.settings.clipping_dir or self.default_clipping_dir
+        end,
+        set = function(path)
+            self.settings.clipping_dir = path
+        end,
+    })
+end
+
+function MyExporter:onDispatcherRegisterActions()
+    Dispatcher:registerAction("myexport_current_notes",
+        {category="none", event="MyExportCurrentNotes", title=_("Export all notes in current book"), reader=true,})
+    Dispatcher:registerAction("myexport_all_notes",
+        {category="none", event="MyExportAllNotes", title=_("Export all notes in all books in history"), reader=true, filemanager=true})
+end
+
+function MyExporter:isReady()
+    for k, v in pairs(self.targets) do
+        if v:isEnabled() then
+            return true
+        end
+    end
+    return false
+end
+
+function MyExporter:isDocReady()
+    return self.document and self.ui.annotation:hasAnnotations() and true or false
+end
+
+function MyExporter:isReadyToExport()
+    return self:isDocReady() and self:isReady()
+end
+
+function MyExporter:requiresFile()
+    for _, v in pairs(self.targets) do
+        if v:isEnabled() and not v.is_remote then
+            return true
+        end
+    end
+end
+
+function MyExporter:requiresNetwork()
+    for k, v in pairs(self.targets) do
+        if v:isEnabled() then
+            if v.is_remote then
+                return true
+            end
+        end
+    end
+end
+
+--- Parse and export highlights from the currently opened document.
+function MyExporter:onMyExportCurrentNotes()
+    if not self:isReadyToExport() then return end
+    self.ui.annotation:updatePageNumbers(true)
+    local clippings = self.parser:parseCurrentDoc()
+    self:exportClippings(clippings)
+end
+
+--- Parse and export highlights from all the documents in History
+-- and from the Kindle "My Clippings.txt".
+function MyExporter:onMyExportAllNotes()
+    if not self:isReady() then return end
+    local clippings = {}
+    clippings = updateHistoryClippings(clippings, self.parser:parseHistory())
+    if Device:isKindle() then
+        clippings = updateHistoryClippings(clippings, self.parser:parseMyClippings())
+    end
+    for title, booknotes in pairs(clippings) do
+        -- chapter number is zero
+        if #booknotes == 0 then
+            clippings[title] = nil
+        end
+    end
+    self:exportClippings(clippings)
+end
+
+--- Parse and export highlights from selected documents.
+-- @tparam table files list of files as a table of {[file_path] = true}
+function MyExporter:exportFilesNotes(files)
+    local clippings = self.parser:parseFiles(files)
+    for title, booknotes in pairs(clippings) do
+        -- chapter number is zero
+        if #booknotes == 0 then
+            clippings[title] = nil
+        end
+    end
+    self:exportClippings(clippings)
+end
+
+function MyExporter:exportClippings(clippings)
+    if type(clippings) ~= "table" then return end
+    local exportables = {}
+    for _title, booknotes in pairs(clippings) do
+        table.insert(exportables, booknotes)
+    end
+    if #exportables == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No highlights to export") })
+        return
+    end
+    local timestamp = os.time()
+    local clipping_filepath
+    if self:requiresFile() then
+        local file, clipping_dir, clipping_filename
+        if #exportables == 1 then
+            file = exportables[1].file
+            clipping_dir = self.settings.clipping_dir_book and ffiUtil.dirname(file)
+                or self.settings.clipping_dir or self.default_clipping_dir
+            clipping_filename = self.settings.clipping_filename_single or self.default_clipping_filename_single
+        else
+            clipping_dir = self.settings.clipping_dir or self.default_clipping_dir
+            clipping_filename = self.settings.clipping_filename_multiple or self.default_clipping_filename_multiple
+        end
+        -- full file path without extension
+        clipping_filename = self.ui.bookinfo:expandString(clipping_filename, file, timestamp)
+        clipping_filename = clipping_filename:gsub("\r?\n", "; ")
+        clipping_filepath = clipping_dir .. "/" .. util.getSafeFilename(clipping_filename, nil, nil, -1)
+    end
+    local export_callback = function()
+        UIManager:nextTick(function()
+            local statuses = {}
+            for k, v in pairs(self.targets) do
+                if v:isEnabled() then
+                    if not v.is_remote then
+                        v.filepath = clipping_filepath
+                    end
+                    v.timestamp = timestamp
+                    local status = v:export(exportables)
+                    if status then
+                        if v.is_remote then
+                            table.insert(statuses, T(_("%1: Exported successfully."), v.name))
+                        else
+                            table.insert(statuses, T(_("%1: Exported to %2."), v.name, v:getFilePath()))
+                        end
+                    else
+                        table.insert(statuses, T(_("%1: Failed to export."), v.name))
+                    end
+                    v.timestamp = nil
+                end
+            end
+            UIManager:show(InfoMessage:new{
+                text = table.concat(statuses, "\n"),
+            })
+        end)
+
+        UIManager:show(InfoMessage:new{
+            text = _("Exporting may take several seconds…"),
+            timeout = 1,
+        })
+    end
+    if self:requiresNetwork() then
+        NetworkMgr:runWhenOnline(export_callback)
+    else
+        export_callback()
+    end
+end
+
+function MyExporter:addToMainMenu(menu_items)
+    self.targets = genExportersTable(self.path)
+    local formats_submenu, share_submenu = {}, {}
+    for k, v in pairs(self.targets) do
+        formats_submenu[#formats_submenu + 1] = v:getMenuTable()
+        if v.shareable then
+            share_submenu[#share_submenu + 1] = {
+                text = T(_("Share as %1"), v.name),
+                callback = function()
+                    local clippings = self.parser:parseCurrentDoc()
+                    local document
+                    for _, notes in pairs(clippings) do
+                        document = notes or {}
+                    end
+                    if #document > 0 then
+                        v:share(document)
+                    end
+                end,
+            }
+        end
+    end
+    table.sort(formats_submenu, function(v1, v2)
+        return v1.text < v2.text
+    end)
+
+    local settings = self.settings
+    local menu = {
+        text = "导出高亮（自制）",
+        -- not listed in reader/filemanager_menu_order.lua (core files we
+        -- don't touch): sort ourselves into the tools menu instead of
+        -- floating around as an orphaned item
+        sorting_hint = "tools",
+        sub_item_table = {
+            {
+                text = _("Export all notes in current book"),
+                enabled_func = function()
+                    return self:isReadyToExport()
+                end,
+                callback = function()
+                    self:onMyExportCurrentNotes()
+                end,
+            },
+            {
+                text = _("Export all notes in all books in history"),
+                enabled_func = function()
+                    return self:isReady()
+                end,
+                callback = function()
+                    self:onMyExportAllNotes()
+                end,
+                separator = #share_submenu == 0,
+            },
+            {
+                text = _("Choose formats and services"),
+                sub_item_table = formats_submenu,
+            },
+            {
+                text = _("Filter by highlight style"),
+                checked_func = function()
+                    return util.tableGetValue(settings, "filter", "style") and true or false
+                end,
+                check_callback_updates_menu = true,
+                callback = function(touchmenu_instance)
+                    UIManager:show(ButtonSelector:new{
+                        current_value = util.tableGetValue(settings, "filter", "style"),
+                        values = ReaderHighlight.getHighlightStyles(),
+                        multi_choice = true,
+                        callback = function(value)
+                            if value then
+                                util.tableSetValue(settings, value, "filter", "style")
+                            else
+                                util.tableRemoveValue(settings, "filter", "style")
+                            end
+                            touchmenu_instance:updateItems()
+                        end,
+                    })
+                end,
+                hold_callback = function(touchmenu_instance)
+                    util.tableRemoveValue(settings, "filter", "style")
+                    touchmenu_instance:updateItems()
+                end,
+            },
+            {
+                text = _("Filter by highlight color"),
+                checked_func = function()
+                    return util.tableGetValue(settings, "filter", "color") and true or false
+                end,
+                check_callback_updates_menu = true,
+                callback = function(touchmenu_instance)
+                    UIManager:show(ButtonSelector:new{
+                        current_value = util.tableGetValue(settings, "filter", "color"),
+                        values = ReaderHighlight.highlight_colors,
+                        bg_colors = ReaderHighlight:getHighlightColorList(),
+                        multi_choice = true,
+                        callback = function(value)
+                            if value then
+                                util.tableSetValue(settings, value, "filter", "color")
+                            else
+                                util.tableRemoveValue(settings, "filter", "color")
+                            end
+                            touchmenu_instance:updateItems()
+                        end,
+                    })
+                end,
+                hold_callback = function(touchmenu_instance)
+                    util.tableRemoveValue(settings, "filter", "color")
+                    touchmenu_instance:updateItems()
+                end,
+                separator = true,
+            },
+            {
+                text = _("Set export filename"),
+                keep_menu_open = true,
+                callback = function()
+                    self:setFilename()
+                end,
+            },
+            {
+                text = _("Choose export folder"),
+                keep_menu_open = true,
+                callback = function()
+                    self:chooseFolder()
+                end,
+            },
+            {
+                text = _("Use book folder for single export"),
+                checked_func = function()
+                    return settings.clipping_dir_book
+                end,
+                callback = function()
+                    settings.clipping_dir_book = not settings.clipping_dir_book or nil
+                end,
+            },
+        },
+    }
+    if #share_submenu > 0 then
+        table.sort(share_submenu, function(v1, v2)
+            return v1.text < v2.text
+        end)
+        table.insert(menu.sub_item_table, 3, {
+            text = _("Share all notes in this book"),
+            enabled_func = function()
+                return self:isDocReady()
+            end,
+            sub_item_table = share_submenu,
+            separator = true,
+        })
+    end
+    menu_items.myexporter = menu
+end
+
+function MyExporter:setFilename()
+    local MultiInputDialog = require("ui/widget/multiinputdialog")
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = _("Set export filename"),
+        fields = {
+            {
+                text = self.settings.clipping_filename_single or self.default_clipping_filename_single,
+                hint = self.default_clipping_filename_single,
+                description = _("Single book"),
+            },
+            {
+                text = self.settings.clipping_filename_multiple or self.default_clipping_filename_multiple,
+                hint = self.default_clipping_filename_multiple,
+                description = _("Multiple books"),
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Info"),
+                    callback = self.ui.bookinfo.expandString,
+                },
+                {
+                    text = _("Default"),
+                    callback = function()
+                        dialog._input_widget:setText(dialog._input_widget.hint)
+                        dialog._input_widget:goToEnd()
+                    end,
+                },
+            },
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Set"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        local filename_single, filename_multiple = unpack(dialog:getFields())
+                        if filename_single == "" or filename_single == self.default_clipping_filename_single then
+                            filename_single = nil
+                        end
+                        self.settings.clipping_filename_single = filename_single
+                        if filename_multiple == "" or filename_multiple == self.default_clipping_filename_multiple then
+                            filename_multiple = nil
+                        end
+                        self.settings.clipping_filename_multiple = filename_multiple
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function MyExporter:chooseFolder()
+    local title_header = _("Current export folder:")
+    local current_path = self.settings.clipping_dir
+    local default_path = self.default_clipping_dir
+    local caller_callback = function(path)
+        if current_path ~= path then
+            self.ui.folder_shortcuts:updateShortcut(MyExporter.name, path)
+            self.settings.clipping_dir = path
+        end
+    end
+    filemanagerutil.showChooseDialog(title_header, caller_callback, current_path, default_path)
+end
+
+return MyExporter
